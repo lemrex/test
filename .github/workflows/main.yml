@@ -1,0 +1,526 @@
+name: Create Isolated Tenant
+
+"on":
+  workflow_dispatch:
+    inputs:
+      tenants:
+        description: 'Tenant Name'
+        required: true
+        default: 'default-tenant'
+        type: choice
+        options:
+          - shared
+          - tenant
+          - Mnn
+          - nin
+
+permissions:
+  contents: write
+  id-token: write
+  pull-requests: write
+
+jobs:
+  copy_tenant:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v2
+
+      - name: Create new ${{ github.event.inputs.tenants }}-seabaas folder
+        run: |
+          if [ -d "${{ github.event.inputs.tenants }}-seabaas" ]; then
+            echo "Folder ${{ github.event.inputs.tenants }}-seabaas already exists. Skipping creation."
+          else
+            cp -r tenants-seabaas ${{ github.event.inputs.tenants }}-seabaas
+            find ${{ github.event.inputs.tenants }}-seabaas -type f -exec sed -i 's/tenants/${{ github.event.inputs.tenants }}/g' {} +
+          fi
+
+      - name: Create new ${{ github.event.inputs.tenants }}-tf folder
+        run: |
+          if [ -d "${{ github.event.inputs.tenants }}-tf" ]; then
+            echo "Folder ${{ github.event.inputs.tenants }}-tf already exists. Skipping creation."
+          else
+            cp -r tenants-tf ${{ github.event.inputs.tenants }}-tf
+            find ${{ github.event.inputs.tenants }}-tf -type f -exec sed -i 's/tenants/${{ github.event.inputs.tenants }}/g' {} +
+          fi
+
+      - name: Commit new tenants-seabaas and tenants-tf folder
+        run: |
+          git config user.name "$GITHUB_ACTOR"
+          git config user.email "$GITHUB_ACTOR@users.noreply.github.com"
+          git add --all
+          git commit -m "Create new tenant seabaas apps for ${{ github.event.inputs.tenants }}" || echo "No changes to commit"
+          git push origin main || (git pull --rebase && git push origin main)
+
+      # - name: Call Build and Deploy Frontend Workflow
+      #   uses: seabaas-co/huawei-cloud/.github/workflows/build-push-tenant-frontend.yaml@main
+      #   with:
+      #     TENANT_NAME: ${{ github.event.inputs.tenants }}
+
+      - name: Set tenant output
+        id: set-output
+        run: echo "tenant=${{ github.event.inputs.tenants }}" >> "$GITHUB_OUTPUT"
+
+  # build_and_deploy_frontend:
+  #   uses: seabaas-co/huawei-cloud/.github/workflows/build-push-tenant-frontend.yaml@main
+  #   needs: copy_tenant
+  #   secrets: inherit
+  #   with:
+  #     TENANT_NAME: ${{ github.event.inputs.tenants }}
+
+  deploy_tenant:
+    runs-on: ubuntu-latest
+    needs: copy_tenant
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v2
+
+      - name: Change to tenant directory
+        run: |
+          # cd ${{ github.event.inputs.tenants }}-tf
+          # pwd
+          tenant_dir="${{ github.event.inputs.tenants }}-tf"
+          if [ -d "$tenant_dir" ]; then
+            cd "$tenant_dir"
+            pwd
+          else
+            echo "Error: Directory $tenant_dir does not exist"
+            exit 1
+          fi
+        shell: bash
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: 1.9.7
+
+      - name: Terraform Init
+        env:
+          TF_VAR_access_key: ${{ secrets.ACCESSKEY }}
+          TF_VAR_secret_key: ${{ secrets.SECRETACCESSKEY }}
+        run: |
+          ls -ll
+          terraform -v
+          terraform init
+
+      - name: Terraform Plan
+        working-directory: ${{ github.event.inputs.tenants }}-tf
+        env:
+          TF_VAR_access_key: ${{ secrets.ACCESSKEY }}
+          TF_VAR_secret_key: ${{ secrets.SECRETACCESSKEY }}
+        run: terraform plan -out=tfplan -input=false
+        shell: bash
+
+      - name: Upload Terraform Plan as Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.event.inputs.tenants }}-tfplan
+          path: ${{ github.event.inputs.tenants }}-tf/tfplan
+
+      - name: Terraform Apply
+        working-directory: ${{ github.event.inputs.tenants }}-tf
+        env:
+          TF_VAR_access_key: ${{ secrets.ACCESSKEY }}
+          TF_VAR_secret_key: ${{ secrets.SECRETACCESSKEY }}
+        run: terraform apply -auto-approve tfplan
+        shell: bash
+
+  initialize-tenants-env:
+    runs-on: ubuntu-latest
+    needs: copy_tenant
+    steps:
+
+      - name: Authenticate to Huawei Cloud
+        uses: huaweicloud/auth-action@v1.0.0
+        with:
+          access_key_id: ${{ secrets.ACCESSKEY }} 
+          secret_access_key: ${{ secrets.SECRETACCESSKEY }}
+          region: 'af-south-1'
+
+      - name: Set up KooCLI
+        uses: huaweicloud/huaweicloud-cli-action@v1.0.0
+
+      - name: Generate kubeconfig from Huawei Cloud CCE
+        run: |
+          cd ${{ github.event.inputs.tenants }}-tf
+          pwd
+          CLUSTER_ID=$(terraform-bin output -raw cluster_id | awk '{print $1}')
+          echo "Cluster ID: $CLUSTER_ID"
+          hcloud CCE CreateKubernetesClusterCert \
+            --cli-region="af-south-1" \
+            --Content-Type="application/json" \
+            --cluster_id="$CLUSTER_ID" \
+            --duration=365 > kubeconfig.json
+
+      - name: Export kubeconfig
+        run: |
+          echo "KUBECONFIG=$PWD/kubeconfig.json" >> $GITHUB_ENV
+
+      - name: Install kubectl
+        run: |
+          curl -LO "https://dl.k8s.io/release/$(curl -sL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+
+      - name: Verify kubectl installation and setup
+        run: |
+          echo "[INFO] Checking kubectl installation..."
+          kubectl version --client
+
+          # --- Check if storageclass exists and is already default ---
+          echo "[INFO] Checking if StorageClass 'csi-disk' exists..."
+          if kubectl get storageclass csi-disk &>/dev/null; then
+
+            # If it exists, check if it is already set as default
+            if kubectl get storageclass csi-disk -o jsonpath='{.metadata.annotations.storageclass\.kubernetes\.io/is-default-class}' | grep -q "true"; then
+              echo "[INFO] StorageClass 'csi-disk' exists and is already set as default — skipping patch."
+            else
+              echo "[INFO] StorageClass 'csi-disk' exists but is not default — patching to set as default..."
+              kubectl patch storageclass csi-disk \
+                -p '{"metadata": {"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
+            fi
+
+          else
+            echo "[WARN] StorageClass 'csi-disk' exist and already set as default— skipping patch."
+          fi
+
+
+          echo "[INFO] Checking if docker-registry secret 'seabaas-co' exists in namespace 'seabaas-core'..."
+          if ! kubectl get secret seabaas-co -n seabaas-core &>/dev/null; then
+            echo "[INFO] Creating docker-registry secret 'seabaas-co'..."
+
+            kubectl create namespace seabaas-core || echo "[INFO] Namespace 'seabaas-core' already exists — skipping creation."
+            kubectl create secret docker-registry seabaas-co \
+              --docker-server=ghcr.io \
+              --docker-username=sterling-retailcore-team \
+              --docker-password=${{ secrets.GH_ACTIONS_PAT }} \
+              --docker-email=infrastructure@bepeerless.co \
+              -n seabaas-core
+          else
+            echo "[INFO] Docker-registry secret 'seabaas-co' already exists — skipping."
+          fi
+
+
+#####
+
+
+
+      - name: Ensure cert-manager namespace
+        run: |
+          kubectl get ns cert-manager || kubectl create ns cert-manager
+
+      - name: Ensure kube-system namespace
+        run: |
+          kubectl get ns kube-system || kubectl create ns kube-system
+
+      - name: Create AWS Secret for cert-manager (if not exists)
+        run: |
+          kubectl get secret route53-credentials-secret -n cert-manager || \
+          kubectl create secret generic route53-credentials-secret \
+            --namespace cert-manager \
+            --from-literal=AWS_ACCESS_KEY_ID=${{ secrets.ROUTE_AWS_ACCESS_KEY_ID }} \
+            --from-literal=AWS_SECRET_ACCESS_KEY=${{ secrets.ROUTE_AWS_SECRET_ACCESS_KEY }}
+
+      - name: Create AWS Secret for ExternalDNS (if not exists)
+        run: |
+          kubectl get secret aws-credentials -n kube-system || \
+          kubectl create secret generic aws-credentials \
+            --namespace kube-system \
+            --from-literal=AWS_ACCESS_KEY_ID=${{ secrets.ROUTE_AWS_ACCESS_KEY_ID }} \
+            --from-literal=AWS_SECRET_ACCESS_KEY=${{ secrets.ROUTE_AWS_SECRET_ACCESS_KEY }}
+
+      - name: Install cert-manager (skip if already installed)
+        run: |
+          kubectl get deploy cert-manager -n cert-manager || \
+          kubectl apply -f https://github.com/cert-manager/cert-manager/releases/latest/download/cert-manager.yaml
+
+      - name: Wait for cert-manager to be ready
+        run: |
+          kubectl rollout status deployment/cert-manager -n cert-manager --timeout=180s
+
+      - name: Create ClusterIssuer if not exists
+        run: |
+          kubectl get clusterissuer letsencrypt-route53 || cat <<EOF | kubectl apply -f -
+          apiVersion: cert-manager.io/v1
+          kind: ClusterIssuer
+          metadata:
+            name: letsencrypt-route53
+          spec:
+            acme:
+              email: devops@bepeerless.co
+              server: https://acme-v02.api.letsencrypt.org/directory
+              privateKeySecretRef:
+                name: route53-issuer-account-key
+              solvers:
+              - dns01:
+                  route53:
+                    region: us-east-1
+                    accessKeyID: ${AWS_ACCESS_KEY_ID}
+                    secretAccessKeySecretRef:
+                      name: route53-credentials-secret
+                      key: AWS_SECRET_ACCESS_KEY
+          EOF
+
+      - name: Add Bitnami repo & update
+        run: |
+          helm repo add bitnami https://charts.bitnami.com/bitnami
+          helm repo update
+
+      - name: Install or upgrade ExternalDNS
+        run: |
+          helm upgrade --install external-dns bitnami/external-dns \
+            --namespace kube-system \
+            --set provider=aws \
+            --set aws.zoneType=public \
+            --set txtOwnerId=external-dns \
+            --set policy=upsert-only \
+            --set registry=txt \
+            --set domainFilters[0]=core.bepeerless.co \
+            --set env[0].name=AWS_ACCESS_KEY_ID \
+            --set env[0].valueFrom.secretKeyRef.name=aws-credentials \
+            --set env[0].valueFrom.secretKeyRef.key=AWS_ACCESS_KEY_ID \
+            --set env[1].name=AWS_SECRET_ACCESS_KEY \
+            --set env[1].valueFrom.secretKeyRef.name=aws-credentials \
+            --set env[1].valueFrom.secretKeyRef.key=AWS_SECRET_ACCESS_KEY
+
+      - name: Create wildcard Certificate if not exists
+        run: |
+          kubectl get certificate wildcard-core-bepeerless-co -n default || cat <<EOF | kubectl apply -f -
+          apiVersion: cert-manager.io/v1
+          kind: Certificate
+          metadata:
+            name: wildcard-core-bepeerless-co
+            namespace: default
+          spec:
+            secretName: wildcard-core-bepeerless-co-tls
+            issuerRef:
+              name: letsencrypt-route53
+              kind: ClusterIssuer
+            commonName: "*.core.bepeerless.co"
+            dnsNames:
+              - "*.core.bepeerless.co"
+          EOF
+
+      - name: Print Status
+        run: |
+          echo "==== CERTIFICATES ===="
+          kubectl get certificates -A
+          echo "==== ISSUERS ===="
+          kubectl get clusterissuers
+          echo "==== ExternalDNS Logs ===="
+          kubectl logs deploy/external-dns -n kube-system || true
+#####
+
+      - name: Install ArgoCD via Helm
+        run: |
+          if ! kubectl get deployment argocd-server -n argocd &>/dev/null; then
+            echo "Installing ArgoCD..."
+            helm repo add argo https://argoproj.github.io/argo-helm
+            helm repo update
+
+              helm upgrade --install argocd argo/argo-cd \
+                --namespace argocd \
+                --create-namespace \
+                --set server.service.type=ClusterIP \
+                --set server.ingress.enabled=true \
+                --set server.ingress.hostname=${{ github.event.inputs.tenants }}-argocd.core.bepeerless.co \
+                --set server.ingress.ingressClassName=nginx \                     # ← tell the controller to pick it up
+                --set server.insecure=true \
+                --set server.exec.enabled=true \
+                --set server.ingress.annotations."nginx\.ingress\.kubernetes\.io/backend-protocol"=HTTPS \  # backend talks HTTPS
+                --set server.ingress.annotations."nginx\.ingress\.kubernetes\.io/ssl-redirect"="true"       # force redirect to HTTPS
+
+
+            kubectl rollout status deployment argocd-server -n argocd --timeout=180s
+            # kubectl wait --for=condition=available --timeout=180s deployment/argocd-server -n argocd
+          else
+            echo "ArgoCD already installed — skipping."
+          fi
+
+      - name: Install Strimzi Kafka Operator via Helm (if not exists)
+        run: |
+
+          echo "[INFO] Checking if Helm release 'strimzi-kafka-operator' exists in namespace 'kafka'..."
+          if helm status strimzi-kafka-operator -n kafka &>/dev/null; then
+            echo "[INFO] Strimzi Kafka Operator is already installed — skipping Helm install."
+          else
+            echo "[INFO] Installing Strimzi Kafka Operator via Helm..."
+            helm repo add strimzi https://strimzi.io/charts/
+            helm repo update
+            helm install strimzi-kafka-operator strimzi/strimzi-kafka-operator \
+              --namespace kafka \
+              --create-namespace \
+              --set watchAnyNamespace=true
+          fi
+
+          echo "[INFO] Waiting for Strimzi operator pod to become ready..."
+          kubectl wait --for=condition=Ready pod \
+            -l app.kubernetes.io/name=strimzi-cluster-operator \
+            -n kafka \
+            --timeout=180s
+
+
+      - name: Install RabbitMQ Operator via Helm (if not exists)
+        run: |
+
+          echo "[INFO] Checking if Helm release 'rabbitmq-cluster-operator' exists in namespace 'rabbitmq'..."
+          if helm status rabbitmq-cluster-operator -n rabbitmq &>/dev/null; then
+            echo "[INFO] RabbitMQ Operator is already installed — skipping Helm install."
+          else
+            echo "[INFO] Installing RabbitMQ Operator via Helm..."
+            helm repo add bitnami https://charts.bitnami.com/bitnami
+            helm repo update
+            helm install rabbitmq-cluster-operator bitnami/rabbitmq-cluster-operator \
+              -n rabbitmq \
+              --create-namespace
+          fi
+
+          echo "[INFO] Waiting for RabbitMQ operator pod to become ready..."
+          kubectl wait --for=condition=Ready pod \
+            -l app.kubernetes.io/name=rabbitmq-cluster-operator \
+            -n rabbitmq \
+            --timeout=180s
+
+
+      - name: Install Stakater Reloader via Helm (if not exists)
+        run: |
+
+          echo "[INFO] Checking if Helm release 'reloader' exists in the current namespace (default if not set)..."
+          if helm status reloader &>/dev/null; then
+            echo "[INFO] Stakater Reloader is already installed — skipping Helm install."
+          else
+            echo "[INFO] Installing Stakater Reloader via Helm..."
+            helm repo add stakater https://stakater.github.io/stakater-charts
+            helm repo update
+            helm install reloader stakater/reloader
+          fi
+
+
+      - name: Install ArgoCD CLI (if not already installed)
+        run: |
+          if command -v argocd &>/dev/null; then
+            echo "[INFO] ArgoCD CLI already installed — skipping download."
+            echo "ARGO_PWD=$(kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' | base64 --decode)" >> $GITHUB_ENV
+          else
+            echo "[INFO] Installing ArgoCD CLI..."
+            curl -sSL -o argocd-linux-amd64 https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+            sudo install -m 555 argocd-linux-amd64 /usr/local/bin/argocd
+            rm argocd-linux-amd64
+            echo "ARGO_PWD=$(kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' | base64 --decode)" >> $GITHUB_ENV
+          fi
+          
+
+      - name: Port-forward ArgoCD server (background)
+        run: |
+          kubectl port-forward svc/argocd-server -n argocd 8080:443 &
+          echo $! > port_forward_pid.txt
+          sleep 5  # Give port-forward time to start
+
+      - name: Login to ArgoCD via port-forwarded address
+        run: |
+          argocd login localhost:8080 \
+            --grpc-web \
+            --insecure \
+            --username admin \
+            --password $ARGO_PWD
+      # - name: Login to ArgoCD
+      #   run: |
+      #     argocd login ${{ github.event.inputs.tenants }}-argocd.shared.seabaas.co \
+      #       --grpc-web \
+      #       --insecure \
+      #       --username admin \
+      #       --password $ARGO_PWD
+            
+      - name: Check if ArgoCD project seabaas-core exists
+        id: check_project
+        run: |
+          if argocd proj get seabaas-core >/dev/null 2>&1; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Apply ArgoCD App Manifests for ${{ github.event.inputs.tenants }}
+        if: steps.check_project.outputs.exists == 'false'
+        run: |
+          kubectl apply -f ${{ github.event.inputs.tenants }}-seabaas/argocd/00-app-project.yaml
+
+      - name: Add ArgoCD Repo Credentials and Register Repo (if not exist)
+        run: |
+          # Check if repo credentials exist
+          if argocd repocreds list | grep -q "https://github.com/sterling-retailcore-team"; then
+            echo "[INFO] Repo credentials for 'https://github.com/sterling-retailcore-team' already exist. Skipping add."
+          else
+            echo "[INFO] Adding repo credentials..."
+            argocd repocreds add https://github.com/sterling-retailcore-team \
+              --username sterling-retailcore-team \
+              --password ${{ secrets.GH_ACTIONS_PAT }}
+          fi
+
+          # Check if repo already added
+          if argocd repo list | grep -q "https://github.com/sterling-retailcore-team/huawei-cloud.git"; then
+            echo "[INFO] Repo 'https://github.com/sterling-retailcore-team/huawei-cloud.git' already added. Skipping add."
+          else
+            echo "[INFO] Adding repo..."
+            argocd repo add https://github.com/sterling-retailcore-team/huawei-cloud.git \
+              --type git \
+              --username sterling-retailcore-team \
+              --password ${{ secrets.GH_ACTIONS_PAT }} \
+              --project seabaas-core
+          fi
+
+      - name: Check if ArgoCD applications exist
+        id: check_apps
+        run: |
+          apps=("configs" "redis" "kafka" "rabbitmq" "service-account" "secret-provider-class" "start-secret" "start-job")
+          missing_apps=()
+
+          for app in "${apps[@]}"; do
+            if ! argocd app get "$app" >/dev/null 2>&1; then
+              missing_apps+=("$app")
+            fi
+          done
+
+          if [ ${#missing_apps[@]} -eq 0 ]; then
+            echo "all_exist=true" >> $GITHUB_OUTPUT
+          else
+            echo "all_exist=false" >> $GITHUB_OUTPUT
+            echo "missing_apps=${missing_apps[*]}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Apply ArgoCD manifests if any app is missing
+        if: steps.check_apps.outputs.all_exist == 'false'
+        run: |
+          kubectl apply -f ${{ github.event.inputs.tenants }}-seabaas/argocd/01-configs.yaml
+          kubectl apply -f ${{ github.event.inputs.tenants }}-seabaas/argocd/02-redis.yaml
+          kubectl apply -f ${{ github.event.inputs.tenants }}-seabaas/argocd/03-kafka.yaml
+          kubectl apply -f ${{ github.event.inputs.tenants }}-seabaas/argocd/05-rabbitmq.yaml
+          kubectl apply -f ${{ github.event.inputs.tenants }}-seabaas/argocd/06-service-account.yaml
+          kubectl apply -f ${{ github.event.inputs.tenants }}-seabaas/argocd/07-secret-provider-class.yaml
+          kubectl apply -f ${{ github.event.inputs.tenants }}-seabaas/argocd/08-start-secret.yaml
+          kubectl apply -f ${{ github.event.inputs.tenants }}-seabaas/argocd/09-start-job.yaml
+
+      - name: Check if ArgoCD ApplicationSets frontend-appset and backend-appset exist
+        id: check_appsets
+        run: |
+          appsets=("frontend-appset" "backend-appset")
+          missing_appsets=()
+
+          for appset in "${appsets[@]}"; do
+            if ! argocd app get "$appset" >/dev/null 2>&1; then
+              missing_appsets+=("$appset")
+            fi
+          done
+
+          if [ ${#missing_appsets[@]} -eq 0 ]; then
+            echo "all_appsets_exist=true" >> $GITHUB_OUTPUT
+          else
+            echo "all_appsets_exist=false" >> $GITHUB_OUTPUT
+            echo "missing_appsets=${missing_appsets[*]}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Apply frontend and backend ApplicationSets if missing
+        if: steps.check_appsets.outputs.all_appsets_exist == 'false'
+        run: |
+          kubectl apply -f ${{ github.event.inputs.tenants }}-seabaas/argocd/10-frontend-appset.yaml
+          kubectl apply -f ${{ github.event.inputs.tenants }}-seabaas/argocd/11-backend-appset.yaml
