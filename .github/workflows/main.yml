@@ -9,11 +9,11 @@ name: Create Isolated Tenant
         default: 'default-tenant'
         type: choice
         options:
-          - shared
-          - tenant
           - Mnn
           - nin
-
+          - shared
+          - tenant
+          - timiddd
 permissions:
   contents: write
   id-token: write
@@ -133,7 +133,7 @@ jobs:
       - name: Authenticate to Huawei Cloud
         uses: huaweicloud/auth-action@v1.0.0
         with:
-          access_key_id: ${{ secrets.ACCESSKEY }} 
+          access_key_id: ${{ secrets.ACCESSKEY }}
           secret_access_key: ${{ secrets.SECRETACCESSKEY }}
           region: 'af-south-1'
 
@@ -338,7 +338,7 @@ jobs:
           fi
 
       - name: Install Strimzi Kafka Operator via Helm (if not exists)
-        run: |
+        run: |2
 
           echo "[INFO] Checking if Helm release 'strimzi-kafka-operator' exists in namespace 'kafka'..."
           if helm status strimzi-kafka-operator -n kafka &>/dev/null; then
@@ -361,7 +361,7 @@ jobs:
 
 
       - name: Install RabbitMQ Operator via Helm (if not exists)
-        run: |
+        run: |2
 
           echo "[INFO] Checking if Helm release 'rabbitmq-cluster-operator' exists in namespace 'rabbitmq'..."
           if helm status rabbitmq-cluster-operator -n rabbitmq &>/dev/null; then
@@ -383,7 +383,7 @@ jobs:
 
 
       - name: Install Stakater Reloader via Helm (if not exists)
-        run: |
+        run: |2
 
           echo "[INFO] Checking if Helm release 'reloader' exists in the current namespace (default if not set)..."
           if helm status reloader &>/dev/null; then
@@ -408,7 +408,7 @@ jobs:
             rm argocd-linux-amd64
             echo "ARGO_PWD=$(kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' | base64 --decode)" >> $GITHUB_ENV
           fi
-          
+
 
       - name: Port-forward ArgoCD server (background)
         run: |
@@ -430,7 +430,6 @@ jobs:
       #       --insecure \
       #       --username admin \
       #       --password $ARGO_PWD
-            
       - name: Check if ArgoCD project seabaas-core exists
         id: check_project
         run: |
